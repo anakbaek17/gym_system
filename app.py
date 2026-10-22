@@ -314,6 +314,7 @@ LOGIN_HTML = '''
 <body style="background: linear-gradient(rgba(11, 15, 25, 0.75), rgba(11, 15, 25, 0.85)), url('https://images.unsplash.com/photo-1534438327276-14e5300c3a48?auto=format&fit=crop&w=1920&q=80'); background-size: cover; background-position: center; color: #f8fafc; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; font-family: 'Inter', sans-serif;">
     <div style="background: rgba(19, 27, 46, 0.85); backdrop-filter: blur(12px); padding: 45px; border-radius: 20px; box-shadow: 0 20px 40px rgba(0,0,0,0.6); width: 100%; max-width: 420px; border: 1px solid rgba(255, 255, 255, 0.1); border-top: 4px solid #f5b000;">
         <h2 style="text-align: center; margin-bottom: 25px; color: #f8fafc; font-weight: 800; font-size: 24px; letter-spacing: 0.5px;">FIT HUB GYM <span style="color: #f5b000;">ACCESS</span></h2>
+        {% if error %}<div style="background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.4); color: #ef4444; padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 20px; text-align: center;">{{ error }}</div>{% endif %}
         <form method="POST">
             <div style="margin-bottom: 20px;">
                 <label style="display: block; margin-bottom: 8px; font-size: 13px; color: #94a3b8; font-weight: 600;">Kode Unik / Nama / Email</label>
@@ -374,6 +375,7 @@ def serve_qris():
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    error = None
     if request.method == 'POST':
         login_input = request.form.get('login_input', '').strip().lower()
         password = request.form.get('password', '').strip()
@@ -392,7 +394,8 @@ def login():
             session['role'] = user['role']
             session['unique_code'] = user['unique_code']
             return redirect(url_for('dashboard'))
-    return render_template_string(LOGIN_HTML)
+        error = 'Kode/Nama/Email atau password salah.'
+    return render_template_string(LOGIN_HTML, error=error)
 
 @app.route('/qr_checkin/<unique_code>')
 def qr_checkin(unique_code):
@@ -459,6 +462,8 @@ def dashboard():
         data['members'] = cursor.fetchall()
         cursor.execute("SELECT workouts.*, users.name as member_name FROM workouts JOIN users ON workouts.member_id = users.id ORDER BY schedule_date DESC")
         data['workouts'] = cursor.fetchall()
+        cursor.execute("SELECT member_targets.*, users.name as member_name FROM member_targets JOIN users ON member_targets.member_id = users.id ORDER BY member_targets.id DESC")
+        data['targets'] = cursor.fetchall()
 
     elif role == 'admin':
         if search_query:
@@ -724,17 +729,21 @@ def dashboard():
             '''
         elif menu == 'set_target':
             options = "".join([f"<option value='{m['id']}'>{m['name']}</option>" for m in data['members']])
+            target_rows = "".join([f"<tr><td>{t['member_name']}</td><td>{t['target_weight']} kg</td><td>{t['target_body_fat']}%</td><td>{t['notes'] or '-'}</td></tr>" for t in data['targets']]) or "<tr><td colspan='4' style='text-align:center; color:#94a3b8;'>Belum ada target.</td></tr>"
             body_content = f'''
                 <h2>Target Latihan Member</h2>
                 <div class="panel-box">
-                    <form onsubmit="event.preventDefault(); alert('Target berhasil disimpan!');">
-                        <label>Pilih Member Binaan</label><select required>{options}</select>
-                        <label>Target Berat Badan (kg)</label><input type="number" step="0.1" required>
-                        <label>Target Body Fat (%)</label><input type="number" step="0.1" required>
-                        <label>Catatan Target</label><textarea rows="3"></textarea>
+                    <form action="/action" method="POST">
+                        <input type="hidden" name="action_type" value="set_target">
+                        <label>Pilih Member Binaan</label><select name="member_id" required>{options}</select>
+                        <label>Target Berat Badan (kg)</label><input type="number" step="0.1" name="target_weight" required>
+                        <label>Target Body Fat (%)</label><input type="number" step="0.1" name="target_body_fat" required>
+                        <label>Catatan Target</label><textarea rows="3" name="notes"></textarea>
                         <button type="submit" class="btn-primary">Tetapkan Target</button>
                     </form>
                 </div>
+                <h3>Target yang Sudah Ditetapkan</h3>
+                <table><tr><th>Member</th><th>Target Berat</th><th>Target Body Fat</th><th>Catatan</th></tr>{target_rows}</table>
             '''
         elif menu == 'monitor_progress':
             rows = ""
@@ -1035,6 +1044,19 @@ def action():
         return redirect(url_for('login'))
     
     action_type = request.form.get('action_type')
+
+    ALLOWED_ROLES = {
+        'process_payment': ['member'],
+        'add_user': ['admin'],
+        'delete_user': ['admin'],
+        'add_equipment': ['admin'],
+        'add_workout': ['trainer'],
+        'set_target': ['trainer'],
+    }
+    if session.get('role') not in ALLOWED_ROLES.get(action_type, []):
+        return "<h1>Akses ditolak</h1>", 403
+
+    next_menu = 'dashboard'
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
@@ -1076,6 +1098,10 @@ def action():
         phone = request.form.get('phone', '').strip()
         password = request.form.get('password').strip()
         
+        if role not in ('member', 'trainer'):
+            conn.close()
+            return "<h1>Role tidak valid</h1>", 400
+        next_menu = 'manage_members' if role == 'member' else 'manage_trainers'
         prefix = 'MEM' if role == 'member' else 'TRN'
         cursor.execute("SELECT COUNT(*) FROM users WHERE role = ?", (role,))
         count = cursor.fetchone()[0] + 1
@@ -1094,21 +1120,39 @@ def action():
 
     elif action_type == 'delete_user':
         u_id = request.form.get('id')
-        cursor.execute("DELETE FROM users WHERE id = ?", (u_id,))
-        conn.commit()
+        cursor.execute("SELECT role FROM users WHERE id = ? AND role IN ('member','trainer')", (u_id,))
+        target = cursor.fetchone()
+        if target:
+            next_menu = 'manage_members' if target[0] == 'member' else 'manage_trainers'
+            cursor.execute("DELETE FROM users WHERE id = ?", (u_id,))
+            conn.commit()
 
     elif action_type == 'add_workout':
         cursor.execute("INSERT INTO workouts (trainer_id, member_id, exercise_name, sets, reps, weight_kg, schedule_date, schedule_time, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Belum')",
                        (session['user_id'], request.form['member_id'], request.form['exercise_name'], request.form['sets'], request.form['reps'], request.form['weight_kg'], request.form['schedule_date'], request.form['schedule_time']))
         conn.commit()
+        next_menu = 'monitor_progress'
+
+    elif action_type == 'set_target':
+        member_id = request.form['member_id']
+        cursor.execute("SELECT id FROM member_targets WHERE member_id = ?", (member_id,))
+        existing = cursor.fetchone()
+        vals = (request.form['target_weight'], request.form['target_body_fat'], request.form.get('notes', '').strip())
+        if existing:
+            cursor.execute("UPDATE member_targets SET target_weight = ?, target_body_fat = ?, notes = ? WHERE member_id = ?", vals + (member_id,))
+        else:
+            cursor.execute("INSERT INTO member_targets (member_id, target_weight, target_body_fat, notes) VALUES (?, ?, ?, ?)", (member_id,) + vals)
+        conn.commit()
+        next_menu = 'set_target'
 
     elif action_type == 'add_equipment':
         cursor.execute("INSERT INTO equipment (equipment_name, category, status) VALUES (?, ?, ?)",
                        (request.form['equipment_name'], request.form['category'], request.form['status']))
         conn.commit()
+        next_menu = 'manage_equipment'
 
     conn.close()
-    return redirect(url_for('dashboard', menu=request.args.get('menu', 'manage_members')))
+    return redirect(url_for('dashboard', menu=next_menu))
 
 @app.route('/logout')
 def logout():
